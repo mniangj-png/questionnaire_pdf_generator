@@ -5708,12 +5708,9 @@ SUPERADMIN_TEST_SUBMISSION_IDS = [
 ]
 
 SUPERADMIN_EXPORT_SOURCE_CANDIDATES = [
-    "data/consultation stat niang export anon3.xlsx",
-    "data/consultation_stat_niang_export_anon3.xlsx",
-    "./data/consultation stat niang export anon3.xlsx",
-    "./data/consultation_stat_niang_export_anon3.xlsx",
-    "consultation stat niang export anon3.xlsx",
-    "consultation_stat_niang_export_anon3.xlsx",
+    "data/consultation_submissions_raw.csv",
+    "./data/consultation_submissions_raw.csv",
+    "consultation_submissions_raw.csv",
 ]
 
 SUPERADMIN_TEMPLATE_CANDIDATES = [
@@ -5771,6 +5768,15 @@ def _sa_text(x: Any) -> str:
         pass
     return str(x).strip()
 
+
+def _sa_strip_email_from_payload_json(payload_json: Any) -> str:
+    p = _sa_json_loads(payload_json)
+    if not isinstance(p, dict):
+        return "{}"
+    p = dict(p)
+    p["email"] = ""
+    return json.dumps(p, ensure_ascii=False)
+
 def _sa_find_sheet_name(sheet_names: List[str], preferred: str, fallback_keywords: List[str]) -> Optional[str]:
     norm = {str(s).strip().lower(): s for s in sheet_names}
     if preferred.lower() in norm:
@@ -5785,31 +5791,27 @@ def _sa_load_clean_source_excel() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFr
     src_path = _sa_find_first_existing_path(SUPERADMIN_EXPORT_SOURCE_CANDIDATES)
     if src_path is None:
         raise FileNotFoundError(
-            "Source introuvable : data/consultation stat niang export anon3.xlsx"
+            "Source introuvable : data/consultation_submissions_raw.csv"
         )
 
-    xls = pd.ExcelFile(src_path)
-    sub_sheet = _sa_find_sheet_name(xls.sheet_names, "submissions", ["submission", "soumission"])
-    raw_sheet = _sa_find_sheet_name(xls.sheet_names, "raw_json", ["raw", "json"])
+    raw_all = pd.read_csv(src_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
 
-    if sub_sheet is None or raw_sheet is None:
-        raise ValueError(
-            f"Feuilles attendues non trouvées dans {src_path.name}. Feuilles disponibles : {xls.sheet_names}"
-        )
+    required = {"submission_id", "submitted_at_utc", "lang", "email", "payload_json"}
+    missing = [c for c in required if c not in raw_all.columns]
+    if missing:
+        raise ValueError(f"Colonnes obligatoires absentes dans {src_path.name} : {missing}")
 
-    submissions = pd.read_excel(src_path, sheet_name=sub_sheet)
-    raw_json = pd.read_excel(src_path, sheet_name=raw_sheet)
+    raw_all = raw_all.copy()
+    raw_all["submitted_at_utc"] = pd.to_datetime(raw_all.get("submitted_at_utc"), errors="coerce", utc=True)
 
-    if "submission_id" not in submissions.columns or "submission_id" not in raw_json.columns:
-        raise ValueError("La colonne submission_id est obligatoire dans les deux feuilles.")
+    raw_clean = raw_all[~raw_all["submission_id"].astype(str).isin(SUPERADMIN_TEST_SUBMISSION_IDS)].copy()
+    raw_clean["payload"] = raw_clean["payload_json"].apply(_sa_json_loads)
 
-    raw_before = len(raw_json)
-    submissions_clean = submissions[~submissions["submission_id"].astype(str).isin(SUPERADMIN_TEST_SUBMISSION_IDS)].copy()
-    raw_clean = raw_json[~raw_json["submission_id"].astype(str).isin(SUPERADMIN_TEST_SUBMISSION_IDS)].copy()
-    raw_clean["payload"] = raw_clean["payload_json"].apply(_sa_json_loads) if "payload_json" in raw_clean.columns else [{} for _ in range(len(raw_clean))]
-    raw_clean["submitted_at_utc"] = pd.to_datetime(raw_clean.get("submitted_at_utc"), errors="coerce", utc=True)
+    submissions_clean = raw_clean.drop(columns=["payload"], errors="ignore").copy()
+    submissions_clean["email"] = ""
+    submissions_clean["payload_json"] = submissions_clean["payload_json"].apply(_sa_strip_email_from_payload_json)
 
-    return submissions_clean, raw_clean, raw_json, src_path
+    return submissions_clean, raw_clean, raw_all, src_path
 
 def _sa_payloads_to_respondents_df(raw_clean: pd.DataFrame) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
@@ -6081,10 +6083,16 @@ def _sa_build_analysis_tables(domain_long: pd.DataFrame, stats_long: pd.DataFram
     return domain_map, stat_map, top_domains, by_stat
 
 def _sa_build_cleaned_source_workbook_bytes(submissions_clean: pd.DataFrame, raw_clean: pd.DataFrame) -> bytes:
+    raw_export = raw_clean.drop(columns=["payload"], errors="ignore").copy()
+    if "email" in raw_export.columns:
+        raw_export["email"] = ""
+    if "payload_json" in raw_export.columns:
+        raw_export["payload_json"] = raw_export["payload_json"].apply(_sa_strip_email_from_payload_json)
+
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         submissions_clean.to_excel(writer, sheet_name="submissions", index=False)
-        raw_clean.drop(columns=["payload"], errors="ignore").to_excel(writer, sheet_name="raw_json", index=False)
+        raw_export.to_excel(writer, sheet_name="raw_json", index=False)
     buf.seek(0)
     return buf.getvalue()
 
@@ -6114,7 +6122,7 @@ def _sa_build_analysis_workbook_bytes(
         submission_rows.append({
             "submission_id": r.get("submission_id"),
             "submitted_at_utc": r.get("submitted_at_utc").strftime("%Y-%m-%dT%H:%M:%SZ") if pd.notna(r.get("submitted_at_utc")) else "",
-            "email": _sa_text(r.get("email")),
+            "email": "",
             "organisation": _sa_text(r.get("organisation")),
             "pays_iso3": _sa_text(r.get("pays_iso3")),
             "type_acteur": _sa_text(r.get("type_acteur")),
@@ -6340,10 +6348,10 @@ def _sa_build_detailed_analysis_docx_bytes(
 def render_superadmin_excel_reporting_tabs(lang: str) -> None:
     st.markdown("### " + t(
         lang,
-        "Livrables à partir de la base Excel source",
-        "Deliverables from the source Excel file",
-        "Entregáveis a partir da base Excel de origem",
-        "المخرجات انطلاقًا من ملف إكسل المصدر",
+        "Livrables à partir de la base CSV source",
+        "Deliverables from the source CSV file",
+        "Entregáveis a partir da base CSV de origem",
+        "المخرجات انطلاقًا من ملف CSV المصدر",
     ))
 
     try:
@@ -6378,8 +6386,8 @@ def render_superadmin_excel_reporting_tabs(lang: str) -> None:
             st.write(
                 t(
                     lang,
-                    "Ce livrable génère un premier reporting de collecte en Word à partir du fichier Excel source nettoyé des 8 soumissions de test.",
-                    "This deliverable generates a first Word collection reporting from the source Excel file after removing the 8 test submissions.",
+                    "Ce livrable génère un premier reporting de collecte en Word à partir du fichier CSV source, après anonymisation des emails et suppression des 8 soumissions de test.",
+                    "This deliverable generates a first Word collection reporting from the source CSV file, after anonymizing emails and removing the 8 test submissions.",
                     "Este entregável gera um primeiro relatório de recolha em Word a partir do ficheiro Excel de origem, após remoção das 8 submissões de teste.",
                     "ينشئ هذا المخرج تقريرًا أوليًا بصيغة Word انطلاقًا من ملف إكسل المصدر بعد حذف 8 الإرسالات التجريبية.",
                 )
@@ -6406,7 +6414,7 @@ def render_superadmin_excel_reporting_tabs(lang: str) -> None:
                 st.download_button(
                     t(lang, "Télécharger la base nettoyée (.xlsx)", "Download cleaned source (.xlsx)"),
                     data=st.session_state["sa_clean_source_xlsx"],
-                    file_name="consultation_stat_niang_export_anon3_clean.xlsx",
+                    file_name="consultation_submissions_raw_clean_anonymized.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="sa_dl_clean_source",
                 )
@@ -6415,8 +6423,8 @@ def render_superadmin_excel_reporting_tabs(lang: str) -> None:
             st.write(
                 t(
                     lang,
-                    "Ce livrable produit un classeur Excel d’analyse à partir du modèle joint et de la base source nettoyée.",
-                    "This deliverable produces an analysis workbook from the attached template and the cleaned source file.",
+                    "Ce livrable produit un classeur Excel d’analyse à partir du modèle joint et de la base CSV source nettoyée et anonymisée.",
+                    "This deliverable produces an analysis workbook from the attached template and the cleaned, anonymized CSV source file.",
                     "Este entregável produz uma pasta Excel de análise a partir do modelo anexo e da base fonte limpa.",
                     "ينتج هذا المخرج دفتر تحليل Excel انطلاقًا من القالب المرفق وملف المصدر المنظف.",
                 )
@@ -6446,8 +6454,8 @@ def render_superadmin_excel_reporting_tabs(lang: str) -> None:
             st.write(
                 t(
                     lang,
-                    "Ce livrable génère un rapport détaillé d’analyse en Word à partir de la base source nettoyée.",
-                    "This deliverable generates a detailed analysis report in Word from the cleaned source file.",
+                    "Ce livrable génère un rapport détaillé d’analyse en Word à partir de la base CSV source nettoyée et anonymisée.",
+                    "This deliverable generates a detailed analysis report in Word from the cleaned, anonymized CSV source file.",
                     "Este entregável gera um relatório detalhado de análise em Word a partir da base fonte limpa.",
                     "ينشئ هذا المخرج تقريرًا تحليليًا مفصلًا بصيغة Word انطلاقًا من ملف المصدر المنظف.",
                 )
