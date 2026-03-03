@@ -16,8 +16,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
-from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
-from openpyxl.utils import get_column_letter
 
 # =========================
 # Configuration Streamlit
@@ -5693,6 +5691,799 @@ def rubric_send(lang: str, df_long: pd.DataFrame) -> None:
 # Admin dashboard
 # =========================
 
+
+# =========================
+# Superadmin reporting from external Excel source
+# =========================
+
+SUPERADMIN_TEST_SUBMISSION_IDS = [
+    "245a3448-ad8e-4841-ad21-de8a18ad365e",
+    "3ac6cbd2-d834-476a-8796-a10d2fdbe7c9",
+    "1509f7af-a5a0-4de6-bcd4-321de3187e77",
+    "e5fdd91a-3d02-4f38-8aa9-ee1faa40c939",
+    "987bc477-eb52-40e0-9bff-5a58ac31d229",
+    "f71cebce-e605-4f0e-9095-a92c70a4a870",
+    "1b22a6ac-906b-4b44-b1f0-c25c71ecc334",
+    "39dccb3f-55f5-4ec7-ab02-31fb24095741",
+]
+
+SUPERADMIN_EXPORT_SOURCE_CANDIDATES = [
+    "data/consultation stat niang export anon3.xlsx",
+    "data/consultation_stat_niang_export_anon3.xlsx",
+    "./data/consultation stat niang export anon3.xlsx",
+    "./data/consultation_stat_niang_export_anon3.xlsx",
+    "consultation stat niang export anon3.xlsx",
+    "consultation_stat_niang_export_anon3.xlsx",
+]
+
+SUPERADMIN_TEMPLATE_CANDIDATES = [
+    "data/Classeur_analyse_app22_plan_tabulation2.xlsx",
+    "./data/Classeur_analyse_app22_plan_tabulation2.xlsx",
+    "Classeur_analyse_app22_plan_tabulation2.xlsx",
+]
+
+def _sa_find_first_existing_path(candidates: List[str]) -> Optional[Path]:
+    roots = [Path("."), Path(__file__).resolve().parent, Path(__file__).resolve().parent / "data"]
+    expanded: List[Path] = []
+    for c in candidates:
+        p = Path(str(c))
+        if p.is_absolute():
+            expanded.append(p)
+        else:
+            expanded.append(p)
+            for root in roots:
+                expanded.append(root / p)
+    seen = set()
+    for p in expanded:
+        try:
+            rp = str(p.resolve())
+        except Exception:
+            rp = str(p)
+        if rp in seen:
+            continue
+        seen.add(rp)
+        if p.exists():
+            return p
+    return None
+
+def _sa_json_loads(x: Any) -> Dict[str, Any]:
+    if isinstance(x, dict):
+        return x
+    if x is None:
+        return {}
+    try:
+        if pd.isna(x):
+            return {}
+    except Exception:
+        pass
+    try:
+        return json.loads(x)
+    except Exception:
+        return {}
+
+def _sa_text(x: Any) -> str:
+    if x is None:
+        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    return str(x).strip()
+
+def _sa_find_sheet_name(sheet_names: List[str], preferred: str, fallback_keywords: List[str]) -> Optional[str]:
+    norm = {str(s).strip().lower(): s for s in sheet_names}
+    if preferred.lower() in norm:
+        return norm[preferred.lower()]
+    for s in sheet_names:
+        sn = str(s).strip().lower()
+        if any(k in sn for k in fallback_keywords):
+            return s
+    return None
+
+def _sa_load_clean_source_excel() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Path]:
+    src_path = _sa_find_first_existing_path(SUPERADMIN_EXPORT_SOURCE_CANDIDATES)
+    if src_path is None:
+        raise FileNotFoundError(
+            "Source introuvable : data/consultation stat niang export anon3.xlsx"
+        )
+
+    xls = pd.ExcelFile(src_path)
+    sub_sheet = _sa_find_sheet_name(xls.sheet_names, "submissions", ["submission", "soumission"])
+    raw_sheet = _sa_find_sheet_name(xls.sheet_names, "raw_json", ["raw", "json"])
+
+    if sub_sheet is None or raw_sheet is None:
+        raise ValueError(
+            f"Feuilles attendues non trouvées dans {src_path.name}. Feuilles disponibles : {xls.sheet_names}"
+        )
+
+    submissions = pd.read_excel(src_path, sheet_name=sub_sheet)
+    raw_json = pd.read_excel(src_path, sheet_name=raw_sheet)
+
+    if "submission_id" not in submissions.columns or "submission_id" not in raw_json.columns:
+        raise ValueError("La colonne submission_id est obligatoire dans les deux feuilles.")
+
+    raw_before = len(raw_json)
+    submissions_clean = submissions[~submissions["submission_id"].astype(str).isin(SUPERADMIN_TEST_SUBMISSION_IDS)].copy()
+    raw_clean = raw_json[~raw_json["submission_id"].astype(str).isin(SUPERADMIN_TEST_SUBMISSION_IDS)].copy()
+    raw_clean["payload"] = raw_clean["payload_json"].apply(_sa_json_loads) if "payload_json" in raw_clean.columns else [{} for _ in range(len(raw_clean))]
+    raw_clean["submitted_at_utc"] = pd.to_datetime(raw_clean.get("submitted_at_utc"), errors="coerce", utc=True)
+
+    return submissions_clean, raw_clean, raw_json, src_path
+
+def _sa_payloads_to_respondents_df(raw_clean: pd.DataFrame) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for _, r in raw_clean.iterrows():
+        p = r.get("payload", {}) or {}
+        rows.append({
+            "submission_id": r.get("submission_id"),
+            "submitted_at_utc": pd.to_datetime(p.get("submitted_at_utc") or r.get("submitted_at_utc"), errors="coerce", utc=True),
+            "email": _sa_text(p.get("email") or r.get("email")),
+            "organisation": _sa_text(p.get("organisation")),
+            "pays_iso3": _sa_text(p.get("pays")),
+            "pays_name_fr": _sa_text(p.get("pays_name_fr")),
+            "type_acteur": _sa_text(p.get("type_acteur")),
+            "fonction": _sa_text(p.get("fonction")),
+            "portee": _sa_text(p.get("scope")),
+            "statut_snds": _sa_text(p.get("snds_status")),
+            "lang": _sa_text(p.get("lang") or r.get("lang")),
+            "consulted_colleagues": _sa_text(p.get("consulted_colleagues")),
+            "gender_priority_1": _sa_text(p.get("gender_priority_1")),
+            "gender_priority_2": _sa_text(p.get("gender_priority_2")),
+            "gender_priority_3": _sa_text(p.get("gender_priority_3")),
+            "gender_priority_other": _sa_text(p.get("gender_priority_other")),
+            "open_q1": _sa_text(p.get("open_q1")),
+            "open_q2": _sa_text(p.get("open_q2")),
+            "open_q3": _sa_text(p.get("open_q3")),
+            "payload": p,
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("submitted_at_utc", ascending=True)
+    return df
+
+def _sa_to_list(v: Any) -> List[str]:
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    if isinstance(v, str):
+        return [x.strip() for x in re.split(r"[;,]", v) if x.strip()]
+    return []
+
+def _sa_build_long_tables(respondents: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    domain_rows: List[Dict[str, Any]] = []
+    stat_rows: List[Dict[str, Any]] = []
+    genre_rows: List[Dict[str, Any]] = []
+    capacity_rows: List[Dict[str, Any]] = []
+    quality_rows: List[Dict[str, Any]] = []
+    dissemination_rows: List[Dict[str, Any]] = []
+    source_rows: List[Dict[str, Any]] = []
+
+    for _, r in respondents.iterrows():
+        sid = r.get("submission_id")
+        p = r.get("payload", {}) or {}
+
+        preselected = _sa_to_list(p.get("preselected_domains"))
+        top5 = _sa_to_list(p.get("top5_domains"))
+        all_domains: List[str] = []
+        for d in preselected + top5:
+            if d and d not in all_domains:
+                all_domains.append(d)
+        for d in all_domains:
+            domain_rows.append({
+                "submission_id": sid,
+                "domain_code": d,
+                "is_preselected": 1 if d in preselected else 0,
+                "top5_rank": (top5.index(d) + 1) if d in top5 else None,
+            })
+
+        selected_by_domain = p.get("selected_by_domain") or {}
+        if isinstance(selected_by_domain, str):
+            selected_by_domain = _sa_json_loads(selected_by_domain)
+        if not isinstance(selected_by_domain, dict):
+            selected_by_domain = {}
+
+        selected_stats = _sa_to_list(p.get("selected_stats"))
+        if not selected_by_domain and selected_stats:
+            tmp: Dict[str, List[str]] = {}
+            for s in selected_stats:
+                tmp.setdefault(str(s)[:3], []).append(s)
+            selected_by_domain = tmp
+
+        scoring = p.get("scoring") or {}
+        if isinstance(scoring, str):
+            scoring = _sa_json_loads(scoring)
+        if not isinstance(scoring, dict):
+            scoring = {}
+        scoring_version = p.get("scoring_version", 0)
+
+        for d, stats in selected_by_domain.items():
+            stats_list = _sa_to_list(stats)
+            for s in stats_list:
+                sc = scoring.get(s, {}) if isinstance(scoring, dict) else {}
+                stat_rows.append({
+                    "submission_id": sid,
+                    "domain_code": d or str(s)[:3],
+                    "stat_code": s,
+                    "demande_politique": int(sc.get("demand") or 0),
+                    "disponibilite_actuelle": normalize_availability(sc.get("availability", sc.get("gap", 0)), scoring_version),
+                    "faisabilite_12_24m": int(sc.get("feasibility") or 0),
+                })
+
+        gender_table = p.get("gender_table") or {}
+        if isinstance(gender_table, dict):
+            for item, rep in gender_table.items():
+                genre_rows.append({"submission_id": sid, "gender_item": item, "reponse": _sa_text(rep)})
+
+        capacity_table = p.get("capacity_table") or {}
+        if isinstance(capacity_table, dict):
+            for item, rep in capacity_table.items():
+                capacity_rows.append({"submission_id": sid, "capacity_item": item, "reponse": _sa_text(rep)})
+
+        for opt in _sa_to_list(p.get("quality_expectations")):
+            quality_rows.append({"submission_id": sid, "option": opt})
+        if _sa_text(p.get("quality_other")):
+            quality_rows.append({"submission_id": sid, "option": "Autre : " + _sa_text(p.get("quality_other"))})
+
+        for opt in _sa_to_list(p.get("dissemination_channels")):
+            dissemination_rows.append({"submission_id": sid, "option": opt})
+        if _sa_text(p.get("dissemination_other")):
+            dissemination_rows.append({"submission_id": sid, "option": "Autre : " + _sa_text(p.get("dissemination_other"))})
+
+        for opt in _sa_to_list(p.get("data_sources")):
+            source_rows.append({"submission_id": sid, "option": opt})
+        if _sa_text(p.get("data_sources_other")):
+            source_rows.append({"submission_id": sid, "option": "Autre : " + _sa_text(p.get("data_sources_other"))})
+
+    return (
+        pd.DataFrame(domain_rows),
+        pd.DataFrame(stat_rows),
+        pd.DataFrame(genre_rows),
+        pd.DataFrame(capacity_rows),
+        pd.DataFrame(quality_rows),
+        pd.DataFrame(dissemination_rows),
+        pd.DataFrame(source_rows),
+    )
+
+def _sa_load_reference_maps_from_template(template_path: Path) -> Tuple[Dict[str, str], Dict[str, str]]:
+    from openpyxl import load_workbook
+
+    wb = load_workbook(template_path, data_only=True)
+    ws = wb["09_référentiels"]
+
+    domain_map: Dict[str, str] = {}
+    stat_map: Dict[str, str] = {}
+
+    for r in range(6, 80):
+        code = ws.cell(r, 1).value
+        lbl = ws.cell(r, 2).value
+        if code:
+            domain_map[str(code)] = str(lbl or code)
+
+    for r in range(22, 400):
+        stat_code = ws.cell(r, 2).value
+        stat_lbl = ws.cell(r, 3).value
+        if stat_code:
+            stat_map[str(stat_code)] = str(stat_lbl or stat_code)
+
+    return domain_map, stat_map
+
+def _sa_build_reporting_stats(respondents: pd.DataFrame, raw_all: pd.DataFrame) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    out["total_raw"] = int(len(raw_all))
+    out["removed_tests"] = int(len(raw_all) - len(respondents))
+    out["total_clean"] = int(len(respondents))
+
+    tmp = respondents.copy()
+    tmp["country_name"] = tmp.apply(lambda r: _sa_text((r.get("payload", {}) or {}).get("pays_name_fr")) or _sa_text(r.get("pays_iso3")), axis=1)
+
+    out["by_country"] = tmp.groupby("country_name", dropna=False).size().reset_index(name="n").sort_values(["n", "country_name"], ascending=[False, True])
+    out["by_actor"] = tmp.groupby("type_acteur", dropna=False).size().reset_index(name="n").sort_values(["n", "type_acteur"], ascending=[False, True])
+
+    emails = tmp["email"].fillna("").astype(str).str.strip().str.lower()
+    q: Dict[str, int] = {
+        "missing_email": int((emails == "").sum()),
+        "duplicate_email": int(emails[emails != ""].duplicated().sum()),
+        "pre_below5": 0,
+        "pre_above10": 0,
+        "stats_below5": 0,
+        "stats_above15": 0,
+        "domain_stat_mismatch": 0,
+        "selected_missing_scores": 0,
+        "open_q1_missing": 0,
+        "open_q2_missing": 0,
+        "open_q3_missing": 0,
+        "open_q2_generic_or_blank": 0,
+    }
+
+    generic_tokens = {"", "nil", "none", "n/a", "na", "aucun", "ras"}
+
+    for _, r in tmp.iterrows():
+        p = r.get("payload", {}) or {}
+        pre = _sa_to_list(p.get("preselected_domains"))
+        if len(pre) < 5:
+            q["pre_below5"] += 1
+        if len(pre) > 10:
+            q["pre_above10"] += 1
+
+        selected_by_domain = p.get("selected_by_domain") or {}
+        if isinstance(selected_by_domain, str):
+            selected_by_domain = _sa_json_loads(selected_by_domain)
+        if not isinstance(selected_by_domain, dict):
+            selected_by_domain = {}
+
+        scoring = p.get("scoring") or {}
+        if isinstance(scoring, str):
+            scoring = _sa_json_loads(scoring)
+        if not isinstance(scoring, dict):
+            scoring = {}
+
+        n_stats = 0
+        for d, stats in selected_by_domain.items():
+            for s in _sa_to_list(stats):
+                n_stats += 1
+                if not str(s).startswith(str(d)):
+                    q["domain_stat_mismatch"] += 1
+                sc = scoring.get(s, {}) if isinstance(scoring, dict) else {}
+                if sc.get("demand") in (None, "") or sc.get("availability", sc.get("gap")) in (None, "") or sc.get("feasibility") in (None, ""):
+                    q["selected_missing_scores"] += 1
+
+        if n_stats < 5:
+            q["stats_below5"] += 1
+        if n_stats > 15:
+            q["stats_above15"] += 1
+
+        oq1 = _sa_text(p.get("open_q1"))
+        oq2 = _sa_text(p.get("open_q2"))
+        oq3 = _sa_text(p.get("open_q3"))
+
+        if not oq1:
+            q["open_q1_missing"] += 1
+        if not oq2:
+            q["open_q2_missing"] += 1
+        if not oq3:
+            q["open_q3_missing"] += 1
+        if oq2.lower().strip() in generic_tokens:
+            q["open_q2_generic_or_blank"] += 1
+
+    out["quality"] = q
+    return out
+
+def _sa_build_analysis_tables(domain_long: pd.DataFrame, stats_long: pd.DataFrame, template_path: Path) -> Tuple[Dict[str, str], Dict[str, str], pd.DataFrame, pd.DataFrame]:
+    domain_map, stat_map = _sa_load_reference_maps_from_template(template_path)
+
+    dom = domain_long.copy()
+    if dom.empty:
+        dom = pd.DataFrame(columns=["submission_id", "domain_code", "is_preselected", "top5_rank"])
+    dom["domain_label"] = dom["domain_code"].map(domain_map).fillna(dom.get("domain_code", ""))
+
+    top_domains = dom[dom["top5_rank"].notna()].groupby(["domain_code", "domain_label"], as_index=False).agg(
+        n_top5=("submission_id", "count"),
+        avg_rank=("top5_rank", "mean"),
+        n_preselected=("is_preselected", "sum"),
+        n_respondents=("submission_id", "nunique"),
+    ).sort_values(["n_top5", "avg_rank"], ascending=[False, True])
+
+    stats = stats_long.copy()
+    if stats.empty:
+        stats = pd.DataFrame(columns=["submission_id", "domain_code", "stat_code", "demande_politique", "disponibilite_actuelle", "faisabilite_12_24m"])
+    stats["domain_label"] = stats["domain_code"].map(domain_map).fillna(stats.get("domain_code", ""))
+    stats["stat_label"] = stats["stat_code"].map(stat_map).fillna(stats.get("stat_code", ""))
+    stats["score_composite_0_9"] = stats[["demande_politique", "disponibilite_actuelle", "faisabilite_12_24m"]].sum(axis=1)
+
+    by_stat = stats.groupby(["domain_code", "domain_label", "stat_code", "stat_label"], as_index=False).agg(
+        n_mentions=("submission_id", "count"),
+        mean_demande=("demande_politique", "mean"),
+        mean_disponibilite=("disponibilite_actuelle", "mean"),
+        mean_faisabilite=("faisabilite_12_24m", "mean"),
+        mean_composite=("score_composite_0_9", "mean"),
+    ).sort_values(["mean_composite", "n_mentions", "mean_demande"], ascending=[False, False, False])
+
+    return domain_map, stat_map, top_domains, by_stat
+
+def _sa_build_cleaned_source_workbook_bytes(submissions_clean: pd.DataFrame, raw_clean: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        submissions_clean.to_excel(writer, sheet_name="submissions", index=False)
+        raw_clean.drop(columns=["payload"], errors="ignore").to_excel(writer, sheet_name="raw_json", index=False)
+    buf.seek(0)
+    return buf.getvalue()
+
+def _sa_write_rows(ws: Any, start_row: int, rows: List[Dict[str, Any]], cols: List[str]) -> None:
+    for i, row in enumerate(rows, start=start_row):
+        for j, key in enumerate(cols, start=1):
+            ws.cell(i, j, row.get(key, None))
+
+def _sa_build_analysis_workbook_bytes(
+    respondents: pd.DataFrame,
+    domain_long: pd.DataFrame,
+    stats_long: pd.DataFrame,
+    genre_long: pd.DataFrame,
+    capacity_long: pd.DataFrame,
+    quality_long: pd.DataFrame,
+    diffusion_long: pd.DataFrame,
+    sources_long: pd.DataFrame,
+    template_path: Path,
+    source_name: str,
+) -> bytes:
+    from openpyxl import load_workbook
+
+    wb = load_workbook(template_path)
+
+    submission_rows: List[Dict[str, Any]] = []
+    for _, r in respondents.iterrows():
+        submission_rows.append({
+            "submission_id": r.get("submission_id"),
+            "submitted_at_utc": r.get("submitted_at_utc").strftime("%Y-%m-%dT%H:%M:%SZ") if pd.notna(r.get("submitted_at_utc")) else "",
+            "email": _sa_text(r.get("email")),
+            "organisation": _sa_text(r.get("organisation")),
+            "pays_iso3": _sa_text(r.get("pays_iso3")),
+            "type_acteur": _sa_text(r.get("type_acteur")),
+            "fonction": _sa_text(r.get("fonction")),
+            "portée": _sa_text(r.get("portee")),
+            "statut_SNDS": _sa_text(r.get("statut_snds")),
+            "lang": _sa_text(r.get("lang")),
+            "consulted_colleagues": _sa_text(r.get("consulted_colleagues")),
+            "gender_priority_1": _sa_text(r.get("gender_priority_1")),
+            "gender_priority_2": _sa_text(r.get("gender_priority_2")),
+            "gender_priority_3": _sa_text(r.get("gender_priority_3")),
+            "gender_priority_other": _sa_text(r.get("gender_priority_other")),
+            "open_q1": _sa_text(r.get("open_q1")),
+            "open_q2": _sa_text(r.get("open_q2")),
+            "open_q3": _sa_text(r.get("open_q3")),
+        })
+
+    _sa_write_rows(wb["01_submissions"], 6, submission_rows, [
+        "submission_id", "submitted_at_utc", "email", "organisation", "pays_iso3", "type_acteur",
+        "fonction", "portée", "statut_SNDS", "lang", "consulted_colleagues", "gender_priority_1",
+        "gender_priority_2", "gender_priority_3", "gender_priority_other", "open_q1", "open_q2", "open_q3"
+    ])
+    _sa_write_rows(wb["02_domains_long"], 6, domain_long.to_dict("records"), ["submission_id", "domain_code", "is_preselected", "top5_rank"])
+    _sa_write_rows(wb["03_stats_long"], 6, stats_long.to_dict("records"), ["submission_id", "domain_code", "stat_code", "demande_politique", "disponibilite_actuelle", "faisabilite_12_24m"])
+    _sa_write_rows(wb["04_genre_long"], 6, genre_long.to_dict("records"), ["submission_id", "gender_item", "reponse"])
+    _sa_write_rows(wb["05_capacité_long"], 6, capacity_long.to_dict("records"), ["submission_id", "capacity_item", "reponse"])
+    _sa_write_rows(wb["06_qualité_long"], 6, quality_long.to_dict("records"), ["submission_id", "option"])
+    _sa_write_rows(wb["07_diffusion_long"], 6, diffusion_long.to_dict("records"), ["submission_id", "option"])
+    _sa_write_rows(wb["08_sources_long"], 6, sources_long.to_dict("records"), ["submission_id", "option"])
+
+    ws0 = wb["00_lisez-moi"]
+    ws0["A16"] = "Source"
+    ws0["B16"] = source_name
+    ws0["A17"] = "Soumissions de test supprimées"
+    ws0["B17"] = len(SUPERADMIN_TEST_SUBMISSION_IDS)
+    ws0["A18"] = "Soumissions conservées"
+    ws0["B18"] = len(respondents)
+
+    try:
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
+    except Exception:
+        pass
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out.getvalue()
+
+def _sa_add_table_from_dataframe(doc: Any, df: pd.DataFrame, headers: List[str], columns: List[str]) -> None:
+    table = doc.add_table(rows=1, cols=len(headers))
+    table.style = "Table Grid"
+    hdr_cells = table.rows[0].cells
+    for i, h in enumerate(headers):
+        hdr_cells[i].text = str(h)
+    for _, r in df.iterrows():
+        cells = table.add_row().cells
+        for i, c in enumerate(columns):
+            v = r.get(c, "")
+            if isinstance(v, float):
+                if np.isnan(v):
+                    txt = ""
+                else:
+                    txt = f"{v:.2f}"
+            else:
+                txt = str(v)
+            cells[i].text = txt
+
+def _sa_build_collection_reporting_docx_bytes(respondents: pd.DataFrame, stats: Dict[str, Any], source_name: str) -> bytes:
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Pt
+
+    doc = Document()
+    doc.styles["Normal"].font.name = "Arial"
+    doc.styles["Normal"].font.size = Pt(10)
+
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run("Premier reporting de collecte")
+    r.bold = True
+    r.font.size = Pt(14)
+
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.add_run(f"Source : {source_name}")
+
+    doc.add_heading("1. Nombre de réponses reçues", level=1)
+    doc.add_paragraph(
+        f"Le fichier source comporte {stats['total_raw']} soumissions brutes. "
+        f"Après suppression des 8 soumissions de test identifiées par submission_id, "
+        f"la base retenue pour l’analyse comprend {stats['total_clean']} réponses valides."
+    )
+
+    doc.add_heading("2. Ventilation par pays", level=1)
+    doc.add_paragraph(f"La collecte couvre {len(stats['by_country'])} pays à ce stade.")
+    _sa_add_table_from_dataframe(doc, stats["by_country"], ["Pays", "Nombre"], ["country_name", "n"])
+
+    doc.add_heading("3. Ventilation par type d’acteur", level=1)
+    actor_df = stats["by_actor"].copy()
+    actor_df["part_pct"] = actor_df["n"].apply(lambda x: round(100 * x / max(stats["total_clean"], 1), 1))
+    _sa_add_table_from_dataframe(doc, actor_df, ["Type d’acteur", "Nombre", "Part (%)"], ["type_acteur", "n", "part_pct"])
+
+    q = stats["quality"]
+    doc.add_heading("4. Principaux points de qualité", level=1)
+    for line in [
+        f"Adresses email manquantes : {q['missing_email']} ; doublons d’email : {q['duplicate_email']}.",
+        f"Pré-sélections de domaines hors bornes 5–10 : {q['pre_below5'] + q['pre_above10']} ; nombres de statistiques hors bornes 5–15 : {q['stats_below5'] + q['stats_above15']}.",
+        f"Incohérences domaine–statistique : {q['domain_stat_mismatch']} ; statistiques sélectionnées sans score complet : {q['selected_missing_scores']}.",
+        f"Questions ouvertes non renseignées : Q1 = {q['open_q1_missing']} ; Q2 = {q['open_q2_missing']} ; Q3 = {q['open_q3_missing']}.",
+        f"Réponses vides ou très génériques à la question sur les indicateurs manquants : {q['open_q2_generic_or_blank']}.",
+    ]:
+        doc.add_paragraph(line, style="List Bullet")
+
+    doc.add_paragraph(
+        "À ce stade, la qualité structurelle de la base est globalement satisfaisante. "
+        "Les principales limites tiennent surtout au caractère encore partiel de la collecte "
+        "et à la faiblesse du remplissage des questions ouvertes en fin de questionnaire."
+    )
+
+    bio = io.BytesIO()
+    doc.save(bio)
+    bio.seek(0)
+    return bio.getvalue()
+
+def _sa_build_detailed_analysis_docx_bytes(
+    respondents: pd.DataFrame,
+    stats: Dict[str, Any],
+    top_domains: pd.DataFrame,
+    by_stat: pd.DataFrame,
+    source_name: str,
+) -> bytes:
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Pt
+
+    doc = Document()
+    doc.styles["Normal"].font.name = "Arial"
+    doc.styles["Normal"].font.size = Pt(10)
+
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run("Rapport détaillé d’analyse")
+    r.bold = True
+    r.font.size = Pt(14)
+
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.add_run(f"Source : {source_name}")
+
+    doc.add_heading("Résumé exécutif", level=1)
+    doc.add_paragraph(
+        f"La base exploitée contient {stats['total_clean']} réponses valides après suppression de 8 soumissions de test. "
+        f"Les réponses couvrent {len(stats['by_country'])} pays et {len(stats['by_actor'])} types d’acteurs. "
+        "Les résultats ci-dessous doivent être lus comme des tendances observées parmi les répondants. "
+        "Ils restent sensibles à la taille encore modeste de l’échantillon et à la couverture inégale des catégories d’acteurs."
+    )
+
+    doc.add_heading("1. Profil de l’échantillon", level=1)
+    doc.add_paragraph(f"Nombre de réponses valides : {stats['total_clean']}.")
+    doc.add_paragraph(f"Nombre de pays couverts : {len(stats['by_country'])}.")
+    doc.add_paragraph(f"Nombre de types d’acteurs représentés : {len(stats['by_actor'])}.")
+    actor_df = stats["by_actor"].copy()
+    actor_df["part_pct"] = actor_df["n"].apply(lambda x: round(100 * x / max(stats["total_clean"], 1), 1))
+    _sa_add_table_from_dataframe(doc, actor_df, ["Type d’acteur", "Nombre", "Part (%)"], ["type_acteur", "n", "part_pct"])
+
+    doc.add_heading("2. Domaines les plus souvent classés dans le Top 5", level=1)
+    if top_domains.empty:
+        doc.add_paragraph("Aucun domaine classé n’a été trouvé dans la base nettoyée.")
+    else:
+        _sa_add_table_from_dataframe(
+            doc,
+            top_domains.head(12),
+            ["Code", "Domaine", "Mentions Top 5", "Rang moyen", "Pré-sélections"],
+            ["domain_code", "domain_label", "n_top5", "avg_rank", "n_preselected"],
+        )
+
+    doc.add_heading("3. Statistiques les mieux notées", level=1)
+    doc.add_paragraph(
+        "Afin d’éviter qu’une note parfaite isolée domine le classement, le tableau ci-dessous "
+        "est restreint aux statistiques citées au moins deux fois."
+    )
+    eligible = by_stat[by_stat["n_mentions"] >= 2].copy()
+    if eligible.empty:
+        doc.add_paragraph("Aucune statistique n’atteint le seuil minimal de deux mentions.")
+    else:
+        _sa_add_table_from_dataframe(
+            doc,
+            eligible.head(20),
+            ["Code domaine", "Domaine", "Code statistique", "Libellé", "Mentions", "Score moyen /9", "Demande moyenne"],
+            ["domain_code", "domain_label", "stat_code", "stat_label", "n_mentions", "mean_composite", "mean_demande"],
+        )
+
+    doc.add_heading("4. Exploitation des questions ouvertes", level=1)
+    for key, title in [("open_q1", "Observations générales"), ("open_q2", "Indicateurs manquants"), ("open_q3", "Besoins d’appui")]:
+        doc.add_heading(title, level=2)
+        values: List[str] = []
+        for _, r in respondents.iterrows():
+            txt = _sa_text((r.get("payload", {}) or {}).get(key))
+            if txt and txt.lower() not in {"nil", "none", "n/a", "na"}:
+                values.append(txt)
+        if not values:
+            doc.add_paragraph("Aucune réponse exploitable.")
+        else:
+            for txt in values[:12]:
+                doc.add_paragraph(txt, style="List Bullet")
+
+    q = stats["quality"]
+    doc.add_heading("5. Qualité des données et limites", level=1)
+    for line in [
+        f"Emails manquants : {q['missing_email']} ; doublons d’email : {q['duplicate_email']}.",
+        f"Pré-sélections hors bornes 5–10 : {q['pre_below5'] + q['pre_above10']} ; statistiques hors bornes 5–15 : {q['stats_below5'] + q['stats_above15']}.",
+        f"Incohérences domaine–statistique : {q['domain_stat_mismatch']} ; statistiques sans score complet : {q['selected_missing_scores']}.",
+        "La faiblesse relative du taux de réponse et la couverture inégale des pays / catégories d’acteurs limitent la portée de généralisation des résultats.",
+    ]:
+        doc.add_paragraph(line, style="List Bullet")
+
+    bio = io.BytesIO()
+    doc.save(bio)
+    bio.seek(0)
+    return bio.getvalue()
+
+def render_superadmin_excel_reporting_tabs(lang: str) -> None:
+    st.markdown("### " + t(
+        lang,
+        "Livrables à partir de la base Excel source",
+        "Deliverables from the source Excel file",
+        "Entregáveis a partir da base Excel de origem",
+        "المخرجات انطلاقًا من ملف إكسل المصدر",
+    ))
+
+    try:
+        submissions_clean, raw_clean, raw_all, src_path = _sa_load_clean_source_excel()
+        respondents = _sa_payloads_to_respondents_df(raw_clean)
+        domain_long, stats_long, genre_long, capacity_long, quality_long, diffusion_long, sources_long = _sa_build_long_tables(respondents)
+
+        template_path = _sa_find_first_existing_path(SUPERADMIN_TEMPLATE_CANDIDATES)
+        if template_path is None:
+            raise FileNotFoundError("Modèle de classeur introuvable : Classeur_analyse_app22_plan_tabulation2.xlsx")
+
+        stats = _sa_build_reporting_stats(respondents, raw_all)
+        _, _, top_domains, by_stat = _sa_build_analysis_tables(domain_long, stats_long, template_path)
+
+        st.caption(
+            t(
+                lang,
+                f"Source : {src_path} | Modèle : {template_path} | Réponses valides : {len(respondents)}",
+                f"Source: {src_path} | Template: {template_path} | Valid responses: {len(respondents)}",
+                f"Fonte: {src_path} | Modelo: {template_path} | Respostas válidas: {len(respondents)}",
+                f"المصدر: {src_path} | القالب: {template_path} | الردود الصالحة: {len(respondents)}",
+            )
+        )
+
+        tab_rep, tab_xlsx, tab_det = st.tabs([
+            t(lang, "Reporting collecte", "Collection reporting", "Relato da recolha", "تقرير التتبع"),
+            t(lang, "Classeur d’analyse", "Analysis workbook", "Pasta de análise", "دفتر التحليل"),
+            t(lang, "Rapport détaillé", "Detailed report", "Relatório detalhado", "تقرير مفصل"),
+        ])
+
+        with tab_rep:
+            st.write(
+                t(
+                    lang,
+                    "Ce livrable génère un premier reporting de collecte en Word à partir du fichier Excel source nettoyé des 8 soumissions de test.",
+                    "This deliverable generates a first Word collection reporting from the source Excel file after removing the 8 test submissions.",
+                    "Este entregável gera um primeiro relatório de recolha em Word a partir do ficheiro Excel de origem, após remoção das 8 submissões de teste.",
+                    "ينشئ هذا المخرج تقريرًا أوليًا بصيغة Word انطلاقًا من ملف إكسل المصدر بعد حذف 8 الإرسالات التجريبية.",
+                )
+            )
+            if st.button(t(lang, "Générer le reporting Word", "Generate Word reporting"), key="sa_btn_collection_report"):
+                try:
+                    st.session_state["sa_collection_report_docx"] = _sa_build_collection_reporting_docx_bytes(respondents, stats, src_path.name)
+                    st.session_state["sa_clean_source_xlsx"] = _sa_build_cleaned_source_workbook_bytes(submissions_clean, raw_clean)
+                    st.success(t(lang, "Reporting généré.", "Reporting generated."))
+                except ModuleNotFoundError as e:
+                    st.error(f"Module manquant : {e}. Ajoutez python-docx et openpyxl dans requirements.txt.")
+                except Exception as e:
+                    st.error(f"{e}")
+
+            if st.session_state.get("sa_collection_report_docx"):
+                st.download_button(
+                    t(lang, "Télécharger le reporting (.docx)", "Download reporting (.docx)"),
+                    data=st.session_state["sa_collection_report_docx"],
+                    file_name="Reporting_collecte.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key="sa_dl_collection_report",
+                )
+            if st.session_state.get("sa_clean_source_xlsx"):
+                st.download_button(
+                    t(lang, "Télécharger la base nettoyée (.xlsx)", "Download cleaned source (.xlsx)"),
+                    data=st.session_state["sa_clean_source_xlsx"],
+                    file_name="consultation_stat_niang_export_anon3_clean.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="sa_dl_clean_source",
+                )
+
+        with tab_xlsx:
+            st.write(
+                t(
+                    lang,
+                    "Ce livrable produit un classeur Excel d’analyse à partir du modèle joint et de la base source nettoyée.",
+                    "This deliverable produces an analysis workbook from the attached template and the cleaned source file.",
+                    "Este entregável produz uma pasta Excel de análise a partir do modelo anexo e da base fonte limpa.",
+                    "ينتج هذا المخرج دفتر تحليل Excel انطلاقًا من القالب المرفق وملف المصدر المنظف.",
+                )
+            )
+            if st.button(t(lang, "Générer le classeur d’analyse", "Generate analysis workbook"), key="sa_btn_analysis_workbook"):
+                try:
+                    st.session_state["sa_analysis_workbook_xlsx"] = _sa_build_analysis_workbook_bytes(
+                        respondents, domain_long, stats_long, genre_long, capacity_long,
+                        quality_long, diffusion_long, sources_long, template_path, src_path.name
+                    )
+                    st.success(t(lang, "Classeur généré.", "Workbook generated."))
+                except ModuleNotFoundError as e:
+                    st.error(f"Module manquant : {e}. Ajoutez openpyxl dans requirements.txt.")
+                except Exception as e:
+                    st.error(f"{e}")
+
+            if st.session_state.get("sa_analysis_workbook_xlsx"):
+                st.download_button(
+                    t(lang, "Télécharger le classeur (.xlsx)", "Download workbook (.xlsx)"),
+                    data=st.session_state["sa_analysis_workbook_xlsx"],
+                    file_name="Classeur_analyse_app22.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="sa_dl_analysis_workbook",
+                )
+
+        with tab_det:
+            st.write(
+                t(
+                    lang,
+                    "Ce livrable génère un rapport détaillé d’analyse en Word à partir de la base source nettoyée.",
+                    "This deliverable generates a detailed analysis report in Word from the cleaned source file.",
+                    "Este entregável gera um relatório detalhado de análise em Word a partir da base fonte limpa.",
+                    "ينشئ هذا المخرج تقريرًا تحليليًا مفصلًا بصيغة Word انطلاقًا من ملف المصدر المنظف.",
+                )
+            )
+            if st.button(t(lang, "Générer le rapport détaillé", "Generate detailed report"), key="sa_btn_detailed_report"):
+                try:
+                    st.session_state["sa_detailed_report_docx"] = _sa_build_detailed_analysis_docx_bytes(
+                        respondents, stats, top_domains, by_stat, src_path.name
+                    )
+                    st.success(t(lang, "Rapport détaillé généré.", "Detailed report generated."))
+                except ModuleNotFoundError as e:
+                    st.error(f"Module manquant : {e}. Ajoutez python-docx dans requirements.txt.")
+                except Exception as e:
+                    st.error(f"{e}")
+
+            if st.session_state.get("sa_detailed_report_docx"):
+                st.download_button(
+                    t(lang, "Télécharger le rapport détaillé (.docx)", "Download detailed report (.docx)"),
+                    data=st.session_state["sa_detailed_report_docx"],
+                    file_name="Rapport_detaille_analyse.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key="sa_dl_detailed_report",
+                )
+
+    except Exception as e:
+        st.warning(
+            t(
+                lang,
+                f"Livrables indisponibles pour le moment : {e}",
+                f"Deliverables temporarily unavailable: {e}",
+                f"Entregáveis temporariamente indisponíveis: {e}",
+                f"المخرجات غير متاحة مؤقتًا: {e}",
+            )
+        )
+
+
 def admin_login(lang: str) -> None:
     st.subheader(t(lang, "Administration", "Administration"))
     pw = st.text_input(t(lang, "Mot de passe admin", "Admin password"), type="password")
@@ -5771,852 +6562,6 @@ def admin_login(lang: str) -> None:
             )
 
 
-
-# =========================
-# Superadmin : reporting de collecte et classeur d'analyse
-# =========================
-
-TEST_SUBMISSION_IDS_TO_EXCLUDE = [
-    "245a3448-ad8e-4841-ad21-de8a18ad365e",
-    "3ac6cbd2-d834-476a-8796-a10d2fdbe7c9",
-    "1509f7af-a5a0-4de6-bcd4-321de3187e77",
-    "e5fdd91a-3d02-4f38-8aa9-ee1faa40c939",
-    "987bc477-eb52-40e0-9bff-5a58ac31d229",
-    "f71cebce-e605-4f0e-9095-a92c70a4a870",
-    "1b22a6ac-906b-4b44-b1f0-c25c71ecc334",
-    "39dccb3f-55f5-4ec7-ab02-31fb24095741",
-]
-
-
-def clean_raw_submissions_df(df_raw: pd.DataFrame, exclude_ids: Optional[List[str]] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Nettoie l'export brut des soumissions en retirant les IDs de test connus."""
-    exclude_ids = exclude_ids or TEST_SUBMISSION_IDS_TO_EXCLUDE
-    if df_raw is None or df_raw.empty:
-        empty = pd.DataFrame(columns=["submission_id", "submitted_at_utc", "lang", "email", "payload_json"])
-        return empty.copy(), empty.copy()
-
-    df = df_raw.copy()
-    for col in ["submission_id", "submitted_at_utc", "lang", "email", "payload_json"]:
-        if col not in df.columns:
-            df[col] = ""
-    df["submission_id"] = df["submission_id"].astype(str).str.strip()
-    removed = df[df["submission_id"].isin(set(exclude_ids))].copy()
-    kept = df[~df["submission_id"].isin(set(exclude_ids))].copy()
-    kept = kept[["submission_id", "submitted_at_utc", "lang", "email", "payload_json"]].reset_index(drop=True)
-    removed = removed[["submission_id", "submitted_at_utc", "lang", "email", "payload_json"]].reset_index(drop=True)
-    return kept, removed
-
-
-def _parse_payload_json_safe(v: Any) -> Dict[str, Any]:
-    if isinstance(v, dict):
-        return v
-    if not isinstance(v, str) or not v.strip():
-        return {}
-    try:
-        return json.loads(v)
-    except Exception:
-        return {}
-
-
-def build_collection_analysis_tables(df_raw_clean: pd.DataFrame, lang: str = "fr") -> Dict[str, Any]:
-    """Construit les tables nécessaires au reporting et au classeur d'analyse."""
-    df_raw_clean = df_raw_clean.copy() if df_raw_clean is not None else pd.DataFrame()
-    payloads: List[Dict[str, Any]] = []
-    bad_json = 0
-    for _, r in df_raw_clean.iterrows():
-        p = _parse_payload_json_safe(r.get("payload_json", ""))
-        if not p:
-            bad_json += 1
-        p.setdefault("submission_id", r.get("submission_id", ""))
-        p.setdefault("submitted_at_utc", r.get("submitted_at_utc", ""))
-        p.setdefault("lang", r.get("lang", ""))
-        p.setdefault("email", r.get("email", ""))
-        payloads.append(p)
-
-    df_payloads = pd.DataFrame(payloads)
-    if df_payloads.empty:
-        df_payloads = pd.DataFrame(columns=[
-            "submission_id", "submitted_at_utc", "email", "organisation", "pays", "type_acteur", "fonction",
-            "scope", "snds_status", "lang", "consulted_colleagues", "open_q1", "open_q2", "open_q3"
-        ])
-
-    df_c = load_countries()
-    _iso3_list, iso3_to_fr, iso3_to_en, iso3_to_pt, iso3_to_ar = country_maps(df_c)
-    df_long = load_longlist()
-    dom_lbl_fr = domain_label_map(df_long, "fr")
-    stat_lbl_fr = stat_label_map(df_long, "fr")
-
-    submission_rows: List[Dict[str, Any]] = []
-    domain_rows: List[Dict[str, Any]] = []
-    stat_rows: List[Dict[str, Any]] = []
-    gender_rows: List[Dict[str, Any]] = []
-    capacity_rows: List[Dict[str, Any]] = []
-    quality_rows: List[Dict[str, Any]] = []
-    dissemination_rows: List[Dict[str, Any]] = []
-    source_rows: List[Dict[str, Any]] = []
-
-    for p in payloads:
-        sid = str(p.get("submission_id", "") or "").strip()
-        email = str(p.get("email", "") or "").strip().lower()
-        pays_iso3 = str(p.get("pays", "") or "").strip().upper()
-        fonction = str(p.get("fonction", "") or p.get("fonction_autre", "") or "").strip()
-
-        submission_rows.append({
-            "submission_id": sid,
-            "submitted_at_utc": p.get("submitted_at_utc", ""),
-            "email": email,
-            "organisation": str(p.get("organisation", "") or "").strip(),
-            "pays_iso3": pays_iso3,
-            "pays_label_fr": country_label(pays_iso3, "fr", iso3_to_fr, iso3_to_en, iso3_to_pt, iso3_to_ar),
-            "type_acteur": str(p.get("type_acteur", "") or "").strip(),
-            "fonction": fonction,
-            "portée": str(p.get("scope", "") or "").strip(),
-            "statut_SNDS": str(p.get("snds_status", "") or "").strip(),
-            "lang": str(p.get("lang", "") or "").strip(),
-            "consulted_colleagues": str(p.get("consulted_colleagues", "") or "").strip(),
-            "gender_priority_1": str(p.get("gender_priority_1", "") or p.get("gender_priority_main", "") or "").strip(),
-            "gender_priority_2": str(p.get("gender_priority_2", "") or "").strip(),
-            "gender_priority_3": str(p.get("gender_priority_3", "") or "").strip(),
-            "gender_priority_other": str(p.get("gender_priority_other", "") or "").strip(),
-            "open_q1": str(p.get("open_q1", "") or "").strip(),
-            "open_q2": str(p.get("open_q2", "") or "").strip(),
-            "open_q3": str(p.get("open_q3", "") or "").strip(),
-        })
-
-        preselected = [str(x).strip() for x in (p.get("preselected_domains") or []) if str(x).strip()]
-        top5 = [str(x).strip() for x in (p.get("top5_domains") or []) if str(x).strip()]
-        union_domains: List[str] = []
-        for d in preselected + top5:
-            if d and d not in union_domains:
-                union_domains.append(d)
-        for d in union_domains:
-            domain_rows.append({
-                "submission_id": sid,
-                "domain_code": d,
-                "domain_label_fr": dom_lbl_fr.get(d, d),
-                "is_preselected": 1 if d in preselected else 0,
-                "top5_rank": (top5.index(d) + 1) if d in top5 else "",
-            })
-
-        scoring = p.get("scoring") or {}
-        selected_by_domain = p.get("selected_by_domain") or {}
-        selected_stats = [str(x).strip() for x in (p.get("selected_stats") or []) if str(x).strip()]
-        pairs: List[Tuple[str, str]] = []
-        if isinstance(selected_by_domain, dict):
-            for d, lst in selected_by_domain.items():
-                if isinstance(lst, list):
-                    for s in lst:
-                        ss = str(s).strip()
-                        dd = str(d).strip()
-                        if ss and (dd, ss) not in pairs:
-                            pairs.append((dd, ss))
-        for s in selected_stats:
-            d = s[:3] if len(s) >= 3 else ""
-            if (d, s) not in pairs:
-                pairs.append((d, s))
-        if isinstance(scoring, dict):
-            for s, _sc in scoring.items():
-                ss = str(s).strip()
-                d = ss[:3] if len(ss) >= 3 else ""
-                if ss and (d, ss) not in pairs:
-                    pairs.append((d, ss))
-
-        for d, s in pairs:
-            sc = scoring.get(s, {}) if isinstance(scoring, dict) else {}
-            demand = int(sc.get("demand", 0) or 0)
-            avail = normalize_availability(sc.get("availability", sc.get("gap", 0)), p.get("scoring_version", 0))
-            feas = int(sc.get("feasibility", 0) or 0)
-            stat_rows.append({
-                "submission_id": sid,
-                "domain_code": d,
-                "domain_label_fr": dom_lbl_fr.get(d, d),
-                "stat_code": s,
-                "stat_label_fr": stat_lbl_fr.get(s, s),
-                "demande_politique": demand,
-                "disponibilite_actuelle": avail,
-                "faisabilite_12_24m": feas,
-            })
-
-        gt = p.get("gender_table") or {}
-        if isinstance(gt, dict):
-            for k, v in gt.items():
-                gender_rows.append({"submission_id": sid, "gender_item": str(k).strip(), "reponse": str(v).strip()})
-
-        ct = p.get("capacity_table") or {}
-        if isinstance(ct, dict):
-            for k, v in ct.items():
-                capacity_rows.append({"submission_id": sid, "capacity_item": str(k).strip(), "reponse": str(v).strip()})
-
-        for item in (p.get("quality_expectations") or []):
-            quality_rows.append({"submission_id": sid, "option": str(item).strip()})
-        for item in (p.get("dissemination_channels") or []):
-            dissemination_rows.append({"submission_id": sid, "option": str(item).strip()})
-        for item in (p.get("data_sources") or []):
-            source_rows.append({"submission_id": sid, "option": str(item).strip()})
-
-    df_submissions = pd.DataFrame(submission_rows)
-    if df_submissions.empty:
-        df_submissions = pd.DataFrame(columns=[
-            "submission_id", "submitted_at_utc", "email", "organisation", "pays_iso3", "pays_label_fr", "type_acteur", "fonction",
-            "portée", "statut_SNDS", "lang", "consulted_colleagues", "gender_priority_1", "gender_priority_2",
-            "gender_priority_3", "gender_priority_other", "open_q1", "open_q2", "open_q3"
-        ])
-    df_submissions["submitted_at_utc"] = pd.to_datetime(df_submissions["submitted_at_utc"], errors="coerce", utc=True)
-    df_submissions["email"] = df_submissions["email"].fillna("").astype(str).str.strip().str.lower()
-    max_dt_by_email = df_submissions.groupby("email")["submitted_at_utc"].transform("max") if not df_submissions.empty else pd.Series(dtype="datetime64[ns, UTC]")
-    df_submissions["keep_latest"] = df_submissions["submitted_at_utc"].eq(max_dt_by_email)
-    actor_counts = df_submissions[df_submissions["keep_latest"]].groupby("type_acteur").size().to_dict()
-    df_submissions["n_acteur"] = df_submissions["type_acteur"].map(actor_counts).fillna(0).astype(int)
-    df_submissions["poids_base"] = df_submissions.apply(
-        lambda r: 0 if (not bool(r.get("keep_latest"))) or int(r.get("n_acteur", 0) or 0) == 0 else 1 / int(r.get("n_acteur", 0)),
-        axis=1,
-    )
-    total_respondents_kept = int(df_submissions["keep_latest"].sum())
-    total_base = float(df_submissions.loc[df_submissions["keep_latest"], "poids_base"].sum()) if not df_submissions.empty else 0.0
-    norm_factor = (total_respondents_kept / total_base) if total_base else 0.0
-    df_submissions["poids_norm"] = df_submissions["poids_base"] * norm_factor
-    df_submissions["submitted_at_utc_excel"] = df_submissions["submitted_at_utc"].dt.tz_convert("UTC").dt.tz_localize(None)
-
-    submission_lookup = df_submissions.set_index("submission_id")[["keep_latest", "poids_norm", "pays_label_fr", "type_acteur"]].to_dict("index") if not df_submissions.empty else {}
-
-    def _attach_flags(df_in: pd.DataFrame) -> pd.DataFrame:
-        if df_in is None or df_in.empty:
-            return df_in if df_in is not None else pd.DataFrame()
-        df_out = df_in.copy()
-        df_out["keep_latest"] = df_out["submission_id"].map(lambda x: bool(submission_lookup.get(x, {}).get("keep_latest", False)))
-        df_out["poids_norm"] = df_out["submission_id"].map(lambda x: float(submission_lookup.get(x, {}).get("poids_norm", 0.0) or 0.0))
-        return df_out
-
-    df_domains = _attach_flags(pd.DataFrame(domain_rows))
-    if df_domains.empty:
-        df_domains = pd.DataFrame(columns=["submission_id", "domain_code", "domain_label_fr", "is_preselected", "top5_rank", "keep_latest", "poids_norm"])
-    df_stats = _attach_flags(pd.DataFrame(stat_rows))
-    if df_stats.empty:
-        df_stats = pd.DataFrame(columns=[
-            "submission_id", "domain_code", "domain_label_fr", "stat_code", "stat_label_fr", "demande_politique",
-            "disponibilite_actuelle", "faisabilite_12_24m", "keep_latest", "poids_norm"
-        ])
-    if not df_stats.empty:
-        df_stats["score_composite_0_9"] = (
-            df_stats[["demande_politique", "disponibilite_actuelle", "faisabilite_12_24m"]]
-            .fillna(0)
-            .astype(float)
-            .sum(axis=1)
-        )
-        df_stats["w_composite"] = df_stats["score_composite_0_9"] * df_stats["poids_norm"]
-        df_stats["w_demande"] = df_stats["demande_politique"] * df_stats["poids_norm"]
-        df_stats["w_dispo"] = df_stats["disponibilite_actuelle"] * df_stats["poids_norm"]
-        df_stats["w_faisab"] = df_stats["faisabilite_12_24m"] * df_stats["poids_norm"]
-
-    df_gender = _attach_flags(pd.DataFrame(gender_rows))
-    if df_gender.empty:
-        df_gender = pd.DataFrame(columns=["submission_id", "gender_item", "reponse", "keep_latest", "poids_norm"])
-    df_capacity = _attach_flags(pd.DataFrame(capacity_rows))
-    if df_capacity.empty:
-        df_capacity = pd.DataFrame(columns=["submission_id", "capacity_item", "reponse", "keep_latest", "poids_norm"])
-    df_quality = _attach_flags(pd.DataFrame(quality_rows))
-    if df_quality.empty:
-        df_quality = pd.DataFrame(columns=["submission_id", "option", "keep_latest", "poids_norm"])
-    df_dissemination = _attach_flags(pd.DataFrame(dissemination_rows))
-    if df_dissemination.empty:
-        df_dissemination = pd.DataFrame(columns=["submission_id", "option", "keep_latest", "poids_norm"])
-    df_sources = _attach_flags(pd.DataFrame(source_rows))
-    if df_sources.empty:
-        df_sources = pd.DataFrame(columns=["submission_id", "option", "keep_latest", "poids_norm"])
-
-    latest = df_submissions[df_submissions["keep_latest"]].copy()
-
-    by_country = (
-        latest.groupby(["pays_iso3", "pays_label_fr"], dropna=False)
-        .size()
-        .reset_index(name="n_reponses")
-        .sort_values(["n_reponses", "pays_label_fr"], ascending=[False, True])
-    ) if not latest.empty else pd.DataFrame(columns=["pays_iso3", "pays_label_fr", "n_reponses"])
-    by_actor = (
-        latest.groupby(["type_acteur"], dropna=False)
-        .size()
-        .reset_index(name="n_reponses")
-        .sort_values(["n_reponses", "type_acteur"], ascending=[False, True])
-    ) if not latest.empty else pd.DataFrame(columns=["type_acteur", "n_reponses"])
-    country_actor = (
-        latest.pivot_table(index="pays_label_fr", columns="type_acteur", values="submission_id", aggfunc="count", fill_value=0)
-        .reset_index()
-    ) if not latest.empty else pd.DataFrame()
-
-    by_domain = (
-        df_domains[df_domains["keep_latest"]]
-        .groupby(["domain_code", "domain_label_fr"], dropna=False)
-        .agg(
-            n_preselected=("is_preselected", "sum"),
-            n_top5=("top5_rank", lambda s: sum(1 for x in s if str(x).strip() != "")),
-            poids_total=("poids_norm", "sum"),
-        )
-        .reset_index()
-        .sort_values(["n_top5", "n_preselected", "domain_code"], ascending=[False, False, True])
-    ) if not df_domains.empty else pd.DataFrame(columns=["domain_code", "domain_label_fr", "n_preselected", "n_top5", "poids_total"])
-
-    by_stat = (
-        df_stats[df_stats["keep_latest"]]
-        .groupby(["domain_code", "domain_label_fr", "stat_code", "stat_label_fr"], dropna=False)
-        .agg(
-            n=("submission_id", "count"),
-            moyenne_demande=("demande_politique", "mean"),
-            moyenne_disponibilite=("disponibilite_actuelle", "mean"),
-            moyenne_faisabilite=("faisabilite_12_24m", "mean"),
-            moyenne_composite=("score_composite_0_9", "mean"),
-            poids_composite=("w_composite", "sum"),
-        )
-        .reset_index()
-        .sort_values(["moyenne_composite", "n", "stat_code"], ascending=[False, False, True])
-    ) if not df_stats.empty else pd.DataFrame(columns=[
-        "domain_code", "domain_label_fr", "stat_code", "stat_label_fr", "n", "moyenne_demande",
-        "moyenne_disponibilite", "moyenne_faisabilite", "moyenne_composite", "poids_composite"
-    ])
-
-    def _summary_options(df_in: pd.DataFrame, col_name: str) -> pd.DataFrame:
-        if df_in is None or df_in.empty:
-            return pd.DataFrame(columns=[col_name, "n", "poids_total"])
-        use = df_in[df_in["keep_latest"]].copy()
-        if use.empty:
-            return pd.DataFrame(columns=[col_name, "n", "poids_total"])
-        out = (
-            use.groupby(col_name, dropna=False)
-            .agg(n=("submission_id", "count"), poids_total=("poids_norm", "sum"))
-            .reset_index()
-            .sort_values(["n", col_name], ascending=[False, True])
-        )
-        return out
-
-    gender_summary = _summary_options(df_gender.rename(columns={"gender_item": "item"}), "item") if not df_gender.empty else pd.DataFrame(columns=["item", "n", "poids_total"])
-    if not df_gender.empty:
-        gender_summary = (
-            df_gender[df_gender["keep_latest"]]
-            .groupby(["gender_item", "reponse"], dropna=False)
-            .agg(n=("submission_id", "count"), poids_total=("poids_norm", "sum"))
-            .reset_index()
-            .sort_values(["gender_item", "n"], ascending=[True, False])
-        )
-    capacity_summary = (
-        df_capacity[df_capacity["keep_latest"]]
-        .groupby(["capacity_item", "reponse"], dropna=False)
-        .agg(n=("submission_id", "count"), poids_total=("poids_norm", "sum"))
-        .reset_index()
-        .sort_values(["capacity_item", "n"], ascending=[True, False])
-    ) if not df_capacity.empty else pd.DataFrame(columns=["capacity_item", "reponse", "n", "poids_total"])
-    quality_summary = _summary_options(df_quality, "option") if not df_quality.empty else pd.DataFrame(columns=["option", "n", "poids_total"])
-    dissemination_summary = _summary_options(df_dissemination, "option") if not df_dissemination.empty else pd.DataFrame(columns=["option", "n", "poids_total"])
-    sources_summary = _summary_options(df_sources, "option") if not df_sources.empty else pd.DataFrame(columns=["option", "n", "poids_total"])
-
-    daily_counts = (
-        latest.assign(date_collecte=latest["submitted_at_utc"].dt.date)
-        .groupby("date_collecte")
-        .size()
-        .reset_index(name="n_reponses")
-        .sort_values("date_collecte")
-    ) if not latest.empty else pd.DataFrame(columns=["date_collecte", "n_reponses"])
-
-    language_summary = (
-        latest.groupby("lang", dropna=False)
-        .size()
-        .reset_index(name="n_reponses")
-        .sort_values(["n_reponses", "lang"], ascending=[False, True])
-    ) if not latest.empty else pd.DataFrame(columns=["lang", "n_reponses"])
-    scope_summary = (
-        latest.groupby("portée", dropna=False)
-        .size()
-        .reset_index(name="n_reponses")
-        .sort_values(["n_reponses", "portée"], ascending=[False, True])
-    ) if not latest.empty else pd.DataFrame(columns=["portée", "n_reponses"])
-    snds_summary = (
-        latest.groupby("statut_SNDS", dropna=False)
-        .size()
-        .reset_index(name="n_reponses")
-        .sort_values(["n_reponses", "statut_SNDS"], ascending=[False, True])
-    ) if not latest.empty else pd.DataFrame(columns=["statut_SNDS", "n_reponses"])
-
-    dup_emails = df_submissions["email"].fillna("")
-    dup_emails = dup_emails[dup_emails.str.strip() != ""]
-    dup_count = int(dup_emails.duplicated(keep=False).sum())
-    missing_required = []
-    for field in ["organisation", "pays_iso3", "type_acteur", "fonction", "lang", "email"]:
-        n_missing = int(df_submissions[field].fillna("").astype(str).str.strip().eq("").sum()) if field in df_submissions.columns else len(df_submissions)
-        missing_required.append({"champ": field, "n_manquants": n_missing})
-    df_missing_required = pd.DataFrame(missing_required)
-
-    domain_top5_not_preselected = 0
-    if not df_domains.empty:
-        tmp_dom = df_domains.copy()
-        tmp_dom["top5_present"] = tmp_dom["top5_rank"].astype(str).str.strip().ne("")
-        tmp_dom["preselected_present"] = tmp_dom["is_preselected"].fillna(0).astype(int).eq(1)
-        domain_top5_not_preselected = int((tmp_dom["top5_present"] & ~tmp_dom["preselected_present"]).sum())
-    score_out_of_range = 0
-    stat_domain_mismatch = 0
-    if not df_stats.empty:
-        score_out_of_range = int(((~df_stats["demande_politique"].between(0, 3)) | (~df_stats["disponibilite_actuelle"].between(0, 3)) | (~df_stats["faisabilite_12_24m"].between(0, 3))).sum())
-        stat_domain_mismatch = int((df_stats["stat_code"].astype(str).str[:3] != df_stats["domain_code"].astype(str)).sum())
-
-    open_q_completion = {
-        "open_q1_filled": int(df_submissions["open_q1"].fillna("").astype(str).str.strip().ne("").sum()),
-        "open_q2_filled": int(df_submissions["open_q2"].fillna("").astype(str).str.strip().ne("").sum()),
-        "open_q3_filled": int(df_submissions["open_q3"].fillna("").astype(str).str.strip().ne("").sum()),
-    }
-    open_q_short = {
-        "open_q1_short": int(df_submissions["open_q1"].fillna("").astype(str).str.len().lt(15).sum()),
-        "open_q2_short": int(df_submissions["open_q2"].fillna("").astype(str).str.len().lt(15).sum()),
-        "open_q3_short": int(df_submissions["open_q3"].fillna("").astype(str).str.len().lt(15).sum()),
-    }
-
-    qc_rows = [
-        {"controle": "Soumissions brutes conservées", "valeur": int(len(df_raw_clean))},
-        {"controle": "Réponses dédupliquées (emails)", "valeur": int(total_respondents_kept)},
-        {"controle": "Emails en doublon (avant déduplication)", "valeur": dup_count},
-        {"controle": "Payloads JSON non lisibles", "valeur": int(bad_json)},
-        {"controle": "Top5 hors pré-sélection", "valeur": int(domain_top5_not_preselected)},
-        {"controle": "Scores hors plage 0-3", "valeur": int(score_out_of_range)},
-        {"controle": "Codes statistique / domaine incohérents", "valeur": int(stat_domain_mismatch)},
-        {"controle": "Q ouverte 1 renseignée", "valeur": int(open_q_completion["open_q1_filled"])},
-        {"controle": "Q ouverte 2 renseignée", "valeur": int(open_q_completion["open_q2_filled"])},
-        {"controle": "Q ouverte 3 renseignée", "valeur": int(open_q_completion["open_q3_filled"])},
-    ]
-    df_qc = pd.DataFrame(qc_rows)
-
-    ref_domains = pd.DataFrame()
-    ref_stats = pd.DataFrame()
-    if df_long is not None and not df_long.empty:
-        ref_domains = (
-            df_long[["domain_code", "domain_label_fr", "domain_label_en"]]
-            .drop_duplicates()
-            .groupby(["domain_code", "domain_label_fr", "domain_label_en"], as_index=False)
-            .size()
-            .rename(columns={"size": "nb_stats"})
-            .sort_values("domain_code")
-        )
-        ref_stats = (
-            df_long[["domain_code", "stat_code", "stat_label_fr", "stat_label_en"]]
-            .drop_duplicates()
-            .sort_values(["domain_code", "stat_code"])
-        )
-    ref_countries = pd.DataFrame()
-    if df_c is not None and not df_c.empty:
-        ref_countries = df_c[["COUNTRY_ISO3", "COUNTRY_NAME_FR", "COUNTRY_NAME_EN"]].drop_duplicates().sort_values("COUNTRY_ISO3")
-
-    return {
-        "raw_clean": df_raw_clean,
-        "payloads": payloads,
-        "payloads_df": df_payloads,
-        "submissions": df_submissions,
-        "domains_long": df_domains,
-        "stats_long": df_stats,
-        "gender_long": df_gender,
-        "capacity_long": df_capacity,
-        "quality_long": df_quality,
-        "dissemination_long": df_dissemination,
-        "sources_long": df_sources,
-        "by_country": by_country,
-        "by_actor": by_actor,
-        "country_actor": country_actor,
-        "by_domain": by_domain,
-        "by_stat": by_stat,
-        "gender_summary": gender_summary,
-        "capacity_summary": capacity_summary,
-        "quality_summary": quality_summary,
-        "dissemination_summary": dissemination_summary,
-        "sources_summary": sources_summary,
-        "daily_counts": daily_counts,
-        "language_summary": language_summary,
-        "scope_summary": scope_summary,
-        "snds_summary": snds_summary,
-        "qc": df_qc,
-        "missing_required": df_missing_required,
-        "ref_domains": ref_domains,
-        "ref_stats": ref_stats,
-        "ref_countries": ref_countries,
-        "open_questions": df_submissions[["submission_id", "email", "organisation", "pays_label_fr", "type_acteur", "open_q1", "open_q2", "open_q3"]].copy(),
-        "meta": {
-            "n_raw_clean": int(len(df_raw_clean)),
-            "n_kept_latest": int(total_respondents_kept),
-            "n_domains_rows": int(len(df_domains)),
-            "n_stats_rows": int(len(df_stats)),
-            "bad_json": int(bad_json),
-            "open_q_completion": open_q_completion,
-            "open_q_short": open_q_short,
-            "dup_email_rows": int(dup_count),
-        },
-    }
-
-
-def _xlsx_safe_value(v: Any) -> Any:
-    if pd.isna(v):
-        return None
-    if isinstance(v, pd.Timestamp):
-        try:
-            if v.tzinfo is not None:
-                v = v.tz_convert("UTC").tz_localize(None)
-        except Exception:
-            try:
-                v = v.tz_localize(None)
-            except Exception:
-                pass
-        return v.to_pydatetime() if hasattr(v, "to_pydatetime") else v
-    return v
-
-
-def _style_ws_header(ws, row_idx: int = 1) -> None:
-    fill = PatternFill("solid", fgColor="1F4E78")
-    font = Font(color="FFFFFF", bold=True)
-    thin = Side(style="thin", color="D9D9D9")
-    for cell in ws[row_idx]:
-        cell.fill = fill
-        cell.font = font
-        cell.border = Border(bottom=thin)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-
-def _autofit_ws(ws, min_width: int = 10, max_width: int = 42) -> None:
-    for idx, col_cells in enumerate(ws.columns, start=1):
-        length = 0
-        for cell in col_cells:
-            try:
-                val = "" if cell.value is None else str(cell.value)
-            except Exception:
-                val = ""
-            length = max(length, len(val))
-        ws.column_dimensions[get_column_letter(idx)].width = max(min_width, min(max_width, length + 2))
-
-
-def _write_df_block(ws, df: pd.DataFrame, start_row: int, title: Optional[str] = None) -> int:
-    row = start_row
-    if title:
-        ws.cell(row=row, column=1, value=title)
-        ws.cell(row=row, column=1).font = Font(bold=True, size=12)
-        row += 1
-    if df is None or df.empty:
-        ws.cell(row=row, column=1, value="Aucune donnée")
-        return row + 2
-    headers = list(df.columns)
-    for col_idx, header in enumerate(headers, start=1):
-        ws.cell(row=row, column=col_idx, value=header)
-    _style_ws_header(ws, row)
-    row += 1
-    for rec in df.itertuples(index=False):
-        for col_idx, value in enumerate(rec, start=1):
-            ws.cell(row=row, column=col_idx, value=_xlsx_safe_value(value))
-        row += 1
-    return row + 1
-
-
-def build_analysis_workbook_bytes(lang: str, df_raw_clean: pd.DataFrame) -> bytes:
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
-    from openpyxl.utils import get_column_letter
-
-    tables = build_collection_analysis_tables(df_raw_clean, lang=lang)
-    wb = Workbook()
-    ws0 = wb.active
-    ws0.title = "00_lisez-moi"
-    ws0["A1"] = "Classeur d’analyse app22 - génération automatique"
-    ws0["A1"].font = Font(bold=True, size=14)
-    ws0["A3"] = "Ce classeur reprend la logique du plan de tabulation fourni, dans une version robuste pour Streamlit / GitHub."
-    ws0["A4"] = f"Date de génération : {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
-    ws0["A5"] = f"Soumissions brutes conservées après retrait des tests : {tables['meta']['n_raw_clean']}"
-    ws0["A6"] = f"Réponses dédupliquées par email : {tables['meta']['n_kept_latest']}"
-    ws0["A8"] = "submission_id exclus automatiquement (tests) :"
-    ws0["A9"] = " ; ".join(TEST_SUBMISSION_IDS_TO_EXCLUDE)
-    ws0.column_dimensions["A"].width = 140
-
-    ws_param = wb.create_sheet("12_paramètres")
-    params_df = pd.DataFrame([
-        {"parametre": "date_generation_utc", "valeur": datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')},
-        {"parametre": "n_soumissions_brutes_nettoyees", "valeur": tables['meta']['n_raw_clean']},
-        {"parametre": "n_reponses_dedup_email", "valeur": tables['meta']['n_kept_latest']},
-        {"parametre": "ids_test_exclus", "valeur": "; ".join(TEST_SUBMISSION_IDS_TO_EXCLUDE)},
-    ])
-    _write_df_block(ws_param, params_df, 1, title="Paramètres d’analyse")
-    _autofit_ws(ws_param)
-
-    ordered_sheets = [
-        ("01_submissions", tables["submissions"][ [
-            "submission_id", "submitted_at_utc_excel", "email", "organisation", "pays_iso3", "type_acteur", "fonction",
-            "portée", "statut_SNDS", "lang", "consulted_colleagues", "gender_priority_1", "gender_priority_2",
-            "gender_priority_3", "gender_priority_other", "open_q1", "open_q2", "open_q3", "keep_latest",
-            "n_acteur", "poids_base", "poids_norm"
-        ]].rename(columns={"submitted_at_utc_excel": "submitted_at_utc"})),
-        ("02_domains_long", tables["domains_long"][["submission_id", "domain_code", "is_preselected", "top5_rank", "keep_latest", "poids_norm"]]),
-        ("03_stats_long", tables["stats_long"][[
-            "submission_id", "domain_code", "stat_code", "demande_politique", "disponibilite_actuelle", "faisabilite_12_24m",
-            "score_composite_0_9", "keep_latest", "poids_norm", "w_composite", "w_demande", "w_dispo", "w_faisab"
-        ]]),
-        ("04_genre_long", tables["gender_long"][["submission_id", "gender_item", "reponse", "keep_latest", "poids_norm"]]),
-        ("05_capacité_long", tables["capacity_long"][["submission_id", "capacity_item", "reponse", "keep_latest", "poids_norm"]]),
-        ("06_qualité_long", tables["quality_long"][["submission_id", "option", "keep_latest", "poids_norm"]]),
-        ("07_diffusion_long", tables["dissemination_long"][["submission_id", "option", "keep_latest", "poids_norm"]]),
-        ("08_sources_long", tables["sources_long"][["submission_id", "option", "keep_latest", "poids_norm"]]),
-    ]
-
-    for sheet_name, df_sheet in ordered_sheets:
-        ws = wb.create_sheet(sheet_name)
-        _write_df_block(ws, df_sheet, 1, title=sheet_name)
-        ws.freeze_panes = "A3"
-        _autofit_ws(ws)
-
-    ws_ref = wb.create_sheet("09_référentiels")
-    next_row = 1
-    next_row = _write_df_block(ws_ref, tables["ref_domains"], next_row, title="Longlist : domaines")
-    next_row = _write_df_block(ws_ref, tables["ref_stats"], next_row, title="Longlist : statistiques")
-    next_row = _write_df_block(ws_ref, tables["ref_countries"], next_row, title="Pays (ISO3)")
-    _autofit_ws(ws_ref)
-
-    ws_calc_stats = wb.create_sheet("13_calc_indicateurs")
-    _write_df_block(ws_calc_stats, tables["by_stat"], 1, title="Agrégation par statistique")
-    ws_calc_stats.freeze_panes = "A3"
-    _autofit_ws(ws_calc_stats)
-
-    ws_calc_dom = wb.create_sheet("14_calc_domaines")
-    _write_df_block(ws_calc_dom, tables["by_domain"], 1, title="Agrégation par domaine")
-    ws_calc_dom.freeze_panes = "A3"
-    _autofit_ws(ws_calc_dom)
-
-    ws15 = wb.create_sheet("15_TAB_T01_T02")
-    r = 1
-    r = _write_df_block(ws15, tables["by_country"], r, title="T01 - Réponses par pays")
-    r = _write_df_block(ws15, tables["by_actor"], r, title="T02 - Réponses par type d’acteur")
-    r = _write_df_block(ws15, tables["country_actor"], r, title="Croisement pays × type d’acteur")
-    _autofit_ws(ws15)
-
-    ws16 = wb.create_sheet("16_TAB_T03_T04")
-    r = 1
-    dom_tab = tables["by_domain"].copy()
-    top5_tab = dom_tab[["domain_code", "domain_label_fr", "n_top5", "poids_total"]].sort_values(["n_top5", "poids_total"], ascending=[False, False]) if not dom_tab.empty else dom_tab
-    pre_tab = dom_tab[["domain_code", "domain_label_fr", "n_preselected", "poids_total"]].sort_values(["n_preselected", "poids_total"], ascending=[False, False]) if not dom_tab.empty else dom_tab
-    r = _write_df_block(ws16, pre_tab, r, title="T03 - Domaines pré-sélectionnés")
-    r = _write_df_block(ws16, top5_tab, r, title="T04 - Domaines classés dans le TOP 5")
-    _autofit_ws(ws16)
-
-    ws17 = wb.create_sheet("17_TAB_T05_T08")
-    r = 1
-    stat_tab = tables["by_stat"].copy()
-    if not stat_tab.empty:
-        top_comp = stat_tab.sort_values(["moyenne_composite", "n"], ascending=[False, False]).head(30)
-        top_dem = stat_tab.sort_values(["moyenne_demande", "n"], ascending=[False, False]).head(30)
-        top_disp = stat_tab.sort_values(["moyenne_disponibilite", "n"], ascending=[False, False]).head(30)
-        top_fea = stat_tab.sort_values(["moyenne_faisabilite", "n"], ascending=[False, False]).head(30)
-    else:
-        top_comp = top_dem = top_disp = top_fea = pd.DataFrame()
-    r = _write_df_block(ws17, top_comp, r, title="T05 - Top statistiques (score composite)")
-    r = _write_df_block(ws17, top_dem, r, title="T06 - Top statistiques (demande politique)")
-    r = _write_df_block(ws17, top_disp, r, title="T07 - Top statistiques (disponibilité actuelle)")
-    r = _write_df_block(ws17, top_fea, r, title="T08 - Top statistiques (faisabilité 12-24 mois)")
-    _autofit_ws(ws17)
-
-    ws18 = wb.create_sheet("18_TAB_T09_T11")
-    r = 1
-    r = _write_df_block(ws18, tables["gender_summary"], r, title="T09 - Tableau genre")
-    r = _write_df_block(ws18, tables["capacity_summary"], r, title="T10 - Capacités du système")
-    r = _write_df_block(ws18, tables["quality_summary"], r, title="T11 - Attentes de qualité")
-    _autofit_ws(ws18)
-
-    ws19 = wb.create_sheet("19_TAB_T12_T14")
-    r = 1
-    r = _write_df_block(ws19, tables["dissemination_summary"], r, title="T12 - Canaux de diffusion")
-    r = _write_df_block(ws19, tables["sources_summary"], r, title="T13 - Sources de données")
-    r = _write_df_block(ws19, tables["daily_counts"], r, title="T14 - Réponses par date de soumission")
-    _autofit_ws(ws19)
-
-    ws20 = wb.create_sheet("20_TAB_T15_T17")
-    r = 1
-    r = _write_df_block(ws20, tables["language_summary"], r, title="T15 - Réponses par langue")
-    r = _write_df_block(ws20, tables["scope_summary"], r, title="T16 - Portée institutionnelle")
-    r = _write_df_block(ws20, tables["snds_summary"], r, title="T17 - Statut de la SNDS")
-    _autofit_ws(ws20)
-
-    ws21 = wb.create_sheet("21_TAB_T18_OUVERT")
-    _write_df_block(ws21, tables["open_questions"], 1, title="T18 - Questions ouvertes")
-    ws21.freeze_panes = "A3"
-    _autofit_ws(ws21)
-
-    ws22 = wb.create_sheet("22_TAB_T19_QC")
-    r = 1
-    r = _write_df_block(ws22, tables["qc"], r, title="T19 - Contrôles qualité")
-    r = _write_df_block(ws22, tables["missing_required"], r, title="Champs manquants sur variables principales")
-    _autofit_ws(ws22)
-
-    ws23 = wb.create_sheet("23_DASHBOARD")
-    ws23["A1"] = "Dashboard synthétique"
-    ws23["A1"].font = Font(bold=True, size=14)
-    dash_rows = [
-        ("Réponses nettoyées", tables["meta"]["n_raw_clean"]),
-        ("Réponses dédupliquées", tables["meta"]["n_kept_latest"]),
-        ("Lignes domaines", tables["meta"]["n_domains_rows"]),
-        ("Lignes statistiques", tables["meta"]["n_stats_rows"]),
-        ("Payloads JSON non lisibles", tables["meta"]["bad_json"]),
-    ]
-    for i, (label, value) in enumerate(dash_rows, start=3):
-        ws23.cell(row=i, column=1, value=label)
-        ws23.cell(row=i, column=2, value=value)
-    _write_df_block(ws23, tables["by_country"].head(15), 10, title="Top pays")
-    _write_df_block(ws23, tables["by_actor"], 30, title="Types d’acteur")
-    _write_df_block(ws23, tables["by_domain"].head(12), 40, title="Domaines les plus cités")
-    _write_df_block(ws23, tables["by_stat"].head(20), 58, title="Top statistiques")
-    _autofit_ws(ws23)
-
-    ws24 = wb.create_sheet("24_ETL_JSON_M")
-    _write_df_block(ws24, tables["raw_clean"], 1, title="Base brute nettoyée (entrée)")
-    _autofit_ws(ws24)
-
-    out = io.BytesIO()
-    wb.save(out)
-    out.seek(0)
-    return out.getvalue()
-
-
-def build_collection_reporting_docx(lang: str, df_raw_clean: pd.DataFrame) -> bytes:
-    from docx import Document
-    from docx.shared import Pt
-
-    tables = build_collection_analysis_tables(df_raw_clean, lang=lang)
-    latest = tables["submissions"][tables["submissions"]["keep_latest"]].copy()
-
-    doc = Document()
-    title = t(
-        lang,
-        "Reporting de collecte - consultation sur l’identification des statistiques socio-économiques prioritaires",
-        "Collection reporting - consultation on identifying priority socio-economic statistics",
-        "Relatório de recolha - consulta sobre a identificação das estatísticas socioeconómicas prioritárias",
-        "تقرير المتابعة - مشاورة تحديد الإحصاءات الاجتماعية والاقتصادية ذات الأولوية",
-    )
-    doc.add_heading(title, level=0)
-    doc.add_paragraph(t(
-        lang,
-        f"Date de génération : {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
-        f"Generation date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
-        f"Data de geração: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
-        f"تاريخ الإنشاء: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
-    ))
-
-    doc.add_heading(t(lang, "1. Nombre de réponses reçues", "1. Number of responses received"), level=1)
-    p = doc.add_paragraph()
-    p.add_run(t(lang, "Soumissions brutes conservées après retrait des tests : ", "Raw submissions kept after removing test rows: ")).bold = True
-    p.add_run(str(tables["meta"]["n_raw_clean"]))
-    p = doc.add_paragraph()
-    p.add_run(t(lang, "Réponses dédupliquées par email : ", "Responses deduplicated by email: ")).bold = True
-    p.add_run(str(tables["meta"]["n_kept_latest"]))
-
-    doc.add_heading(t(lang, "2. Ventilation par pays", "2. Breakdown by country"), level=1)
-    if tables["by_country"].empty:
-        doc.add_paragraph(t(lang, "Aucune réponse exploitable à ce stade.", "No usable responses at this stage."))
-    else:
-        tab = doc.add_table(rows=1, cols=3)
-        hdr = tab.rows[0].cells
-        hdr[0].text = t(lang, "ISO3", "ISO3")
-        hdr[1].text = t(lang, "Pays", "Country")
-        hdr[2].text = t(lang, "Nombre", "Count")
-        for _, r in tables["by_country"].iterrows():
-            row = tab.add_row().cells
-            row[0].text = str(r.get("pays_iso3", ""))
-            row[1].text = str(r.get("pays_label_fr", ""))
-            row[2].text = str(int(r.get("n_reponses", 0) or 0))
-
-    doc.add_heading(t(lang, "3. Ventilation par type d’acteur", "3. Breakdown by stakeholder type"), level=1)
-    if tables["by_actor"].empty:
-        doc.add_paragraph(t(lang, "Aucune réponse exploitable à ce stade.", "No usable responses at this stage."))
-    else:
-        tab = doc.add_table(rows=1, cols=2)
-        hdr = tab.rows[0].cells
-        hdr[0].text = t(lang, "Type d’acteur", "Stakeholder type")
-        hdr[1].text = t(lang, "Nombre", "Count")
-        for _, r in tables["by_actor"].iterrows():
-            row = tab.add_row().cells
-            row[0].text = str(r.get("type_acteur", ""))
-            row[1].text = str(int(r.get("n_reponses", 0) or 0))
-
-    doc.add_heading(t(lang, "4. Principaux points de qualité", "4. Main data quality points"), level=1)
-    bullets = [
-        t(
-            lang,
-            f"Manquants sur variables principales : organisation={int(tables['missing_required'].loc[tables['missing_required']['champ']=='organisation','n_manquants'].sum())}, pays={int(tables['missing_required'].loc[tables['missing_required']['champ']=='pays_iso3','n_manquants'].sum())}, type d’acteur={int(tables['missing_required'].loc[tables['missing_required']['champ']=='type_acteur','n_manquants'].sum())}, fonction={int(tables['missing_required'].loc[tables['missing_required']['champ']=='fonction','n_manquants'].sum())}, email={int(tables['missing_required'].loc[tables['missing_required']['champ']=='email','n_manquants'].sum())}.",
-            f"Missingness on main variables: organisation={int(tables['missing_required'].loc[tables['missing_required']['champ']=='organisation','n_manquants'].sum())}, country={int(tables['missing_required'].loc[tables['missing_required']['champ']=='pays_iso3','n_manquants'].sum())}, stakeholder type={int(tables['missing_required'].loc[tables['missing_required']['champ']=='type_acteur','n_manquants'].sum())}, function={int(tables['missing_required'].loc[tables['missing_required']['champ']=='fonction','n_manquants'].sum())}, email={int(tables['missing_required'].loc[tables['missing_required']['champ']=='email','n_manquants'].sum())}."
-        ),
-        t(
-            lang,
-            f"Incohérences rares repérées : Top 5 hors pré-sélection={int(tables['qc'].loc[tables['qc']['controle']=='Top5 hors pré-sélection','valeur'].sum())}, scores hors plage 0-3={int(tables['qc'].loc[tables['qc']['controle']=='Scores hors plage 0-3','valeur'].sum())}, codes statistique / domaine incohérents={int(tables['qc'].loc[tables['qc']['controle']=='Codes statistique / domaine incohérents','valeur'].sum())}.",
-            f"Rare inconsistencies identified: Top 5 outside preselection={int(tables['qc'].loc[tables['qc']['controle']=='Top5 hors pré-sélection','valeur'].sum())}, scores outside 0-3 range={int(tables['qc'].loc[tables['qc']['controle']=='Scores hors plage 0-3','valeur'].sum())}, inconsistent indicator/domain codes={int(tables['qc'].loc[tables['qc']['controle']=='Codes statistique / domaine incohérents','valeur'].sum())}."
-        ),
-        t(
-            lang,
-            f"Difficultés de compréhension ou fatigue de remplissage : les questions ouvertes demeurent moins renseignées (Q1={tables['meta']['open_q_completion']['open_q1_filled']}, Q2={tables['meta']['open_q_completion']['open_q2_filled']}, Q3={tables['meta']['open_q_completion']['open_q3_filled']} réponses renseignées sur {tables['meta']['n_raw_clean']}). Cela suggère un besoin de formulation plus guidée en fin de questionnaire.",
-            f"Comprehension difficulties or respondent fatigue: the open-ended questions remain less frequently completed (Q1={tables['meta']['open_q_completion']['open_q1_filled']}, Q2={tables['meta']['open_q_completion']['open_q2_filled']}, Q3={tables['meta']['open_q_completion']['open_q3_filled']} completed responses out of {tables['meta']['n_raw_clean']}). This suggests a need for more guided wording at the end of the questionnaire."
-        ),
-    ]
-    for b in bullets:
-        doc.add_paragraph(b, style="List Bullet")
-
-    doc.add_heading(t(lang, "5. Remarques opérationnelles", "5. Operational remarks"), level=1)
-    doc.add_paragraph(t(
-        lang,
-        "Les tableaux du présent reporting sont générés automatiquement à partir de la base brute nettoyée et dédupliquée par email (conservation de la soumission la plus récente).",
-        "The tables in this reporting are generated automatically from the cleaned raw database and deduplicated by email (keeping the most recent submission).",
-    ))
-
-    out = io.BytesIO()
-    doc.save(out)
-    out.seek(0)
-    return out.getvalue()
-
-
-def render_superadmin_reporting_tab(lang: str, df_raw_current: pd.DataFrame) -> None:
-    st.subheader(t(lang, "Reporting de collecte et classeur d’analyse", "Collection reporting and analysis workbook"))
-    cleaned_raw, removed_raw = clean_raw_submissions_df(df_raw_current, TEST_SUBMISSION_IDS_TO_EXCLUDE)
-    colm1, colm2, colm3 = st.columns(3)
-    colm1.metric(t(lang, "Soumissions brutes", "Raw submissions"), len(df_raw_current))
-    colm2.metric(t(lang, "Tests retirés", "Removed test rows"), len(removed_raw))
-    colm3.metric(t(lang, "Soumissions conservées", "Retained submissions"), len(cleaned_raw))
-
-    with st.expander(t(lang, "Voir les submission_id exclus", "See excluded submission_id values")):
-        st.write(TEST_SUBMISSION_IDS_TO_EXCLUDE)
-        if not removed_raw.empty:
-            st.dataframe(removed_raw[["submission_id", "submitted_at_utc", "email"]], use_container_width=True)
-
-    csv_clean = cleaned_raw.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        t(lang, "Télécharger la base brute nettoyée (.csv)", "Download cleaned raw database (.csv)"),
-        data=csv_clean,
-        file_name="consultation_submissions_raw_cleaned.csv",
-        mime="text/csv",
-        key="dl_clean_raw_csv",
-    )
-
-    st.markdown("### " + t(lang, "Reporting Word de la collecte", "Collection reporting Word file"))
-    if st.button(t(lang, "Générer le reporting Word", "Generate Word reporting"), key="btn_generate_reporting_docx"):
-        try:
-            doc_bytes = build_collection_reporting_docx(lang, cleaned_raw)
-            st.download_button(
-                t(lang, "Télécharger le reporting (.docx)", "Download reporting (.docx)"),
-                data=doc_bytes,
-                file_name="Reporting_collecte_app22.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                key="dl_reporting_docx",
-            )
-            st.success(t(lang, "Reporting généré avec succès.", "Reporting generated successfully."))
-        except Exception as e:
-            st.error(f"DOCX : {e}")
-
-    st.markdown("### " + t(lang, "Classeur Excel d’analyse", "Excel analysis workbook"))
-    st.caption(t(lang, "Version robuste inspirée du modèle joint, avec les onglets d’entrée, de calcul, de tabulation et de dashboard.", "Robust version inspired by the attached model, with input, calculation, tabulation and dashboard sheets."))
-    if st.button(t(lang, "Générer le classeur d’analyse", "Generate analysis workbook"), key="btn_generate_analysis_xlsx"):
-        try:
-            xlsx_bytes = build_analysis_workbook_bytes(lang, cleaned_raw)
-            st.download_button(
-                t(lang, "Télécharger le classeur (.xlsx)", "Download workbook (.xlsx)"),
-                data=xlsx_bytes,
-                file_name="Classeur_analyse_app22_auto.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="dl_analysis_xlsx",
-            )
-            st.success(t(lang, "Classeur généré avec succès.", "Workbook generated successfully."))
-        except Exception as e:
-            st.error(f"XLSX : {e}")
-
-
 def admin_dashboard(lang: str) -> None:
     st.subheader(t(lang, "Tableau de bord admin", "Admin dashboard"))
 
@@ -6644,10 +6589,9 @@ def admin_dashboard(lang: str) -> None:
     is_super = st.session_state.get("admin_role") == "superadmin"
 
     if is_super:
-        tab_quick, tab_super, tab_reporting, tab_sec = st.tabs([
+        tab_quick, tab_super, tab_sec = st.tabs([
             t(lang, "Vue rapide", "Quick view"),
             t(lang, "Analyse avancée", "Advanced analysis"),
-            t(lang, "Reporting collecte", "Collection reporting", "Relato da recolha", "تقرير الجمع"),
             t(lang, "Sécurité", "Security"),
         ])
     else:
@@ -6939,9 +6883,8 @@ def admin_dashboard(lang: str) -> None:
                 st.error(f"Word : {e}")
 
 
-    with tab_reporting:
-        render_superadmin_reporting_tab(lang, df)
-
+        st.divider()
+        render_superadmin_excel_reporting_tabs(lang)
 
     with tab_sec:
         st.subheader(t(lang, "Sécurité", "Security"))
@@ -7170,4 +7113,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
